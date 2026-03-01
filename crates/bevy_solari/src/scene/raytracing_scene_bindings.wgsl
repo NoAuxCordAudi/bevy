@@ -213,7 +213,7 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
         let T = TBN[0];
         let B = TBN[1];
         let N = TBN[2];
-        let Nt = sample_texture(material.normal_map_texture_id, uv);
+        let Nt = sample_texture(material.normal_map_texture_id, uv) * 2.0 - 1.0;
         world_normal = normalize(Nt.x * T + Nt.y * B + Nt.z * N);
     }
 
