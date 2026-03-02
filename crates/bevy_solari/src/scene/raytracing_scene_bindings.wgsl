@@ -4,6 +4,7 @@ enable wgpu_ray_query;
 
 #import bevy_pbr::lighting::perceptualRoughnessToRoughness
 #import bevy_pbr::pbr_functions::calculate_tbn_mikktspace
+#import bevy_render::maths::inverse_mat3x3
 
 struct InstanceGeometryIds {
     vertex_buffer_id: u32,
@@ -149,7 +150,7 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
         m.metallic *= metallic_roughness.b;
     }
 
-    m.roughness = m.perceptual_roughness * m.perceptual_roughness;
+    m.roughness = perceptualRoughnessToRoughness(m.perceptual_roughness);
 
     return m;
 }
@@ -199,15 +200,22 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
 
     let uv = mat3x2(vertices[0].uv, vertices[1].uv, vertices[2].uv) * barycentrics;
 
+    let model_3x3 = mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz);
+    let normal_transform = transpose(inverse_mat3x3(model_3x3));
+
     let local_tangent = mat3x3(vertices[0].tangent.xyz, vertices[1].tangent.xyz, vertices[2].tangent.xyz) * barycentrics;
     let world_tangent = vec4(
-        normalize(mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz) * local_tangent),
+        normalize(model_3x3 * local_tangent),
         vertices[0].tangent.w,
     );
 
-    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics; // TODO: Use barycentric lerp, ray_hit.object_to_world, cross product geo normal
-    var world_normal = normalize(mat3x3(transform[0].xyz, transform[1].xyz, transform[2].xyz) * local_normal);
-    let geometric_world_normal = world_normal;
+    let triangle_edge0 = world_vertices[0] - world_vertices[1];
+    let triangle_edge1 = world_vertices[0] - world_vertices[2];
+    let triangle_area = length(cross(triangle_edge0, triangle_edge1)) / 2.0;
+    let geometric_world_normal = normalize(cross(triangle_edge0, triangle_edge1));
+
+    let local_normal = mat3x3(vertices[0].normal, vertices[1].normal, vertices[2].normal) * barycentrics;
+    var world_normal = normalize(normal_transform * local_normal);
     if material.normal_map_texture_id != TEXTURE_MAP_NONE {
         let TBN = calculate_tbn_mikktspace(world_normal, world_tangent);
         let T = TBN[0];
@@ -216,10 +224,6 @@ fn resolve_triangle_data_full(instance_id: u32, triangle_id: u32, barycentrics: 
         let Nt = sample_texture(material.normal_map_texture_id, uv) * 2.0 - 1.0;
         world_normal = normalize(Nt.x * T + Nt.y * B + Nt.z * N);
     }
-
-    let triangle_edge0 = world_vertices[0] - world_vertices[1];
-    let triangle_edge1 = world_vertices[0] - world_vertices[2];
-    let triangle_area = length(cross(triangle_edge0, triangle_edge1)) / 2.0;
 
     let resolved_material = resolve_material(material, uv);
 

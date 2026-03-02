@@ -9,6 +9,12 @@ enable wgpu_ray_query;
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, sample_ggx_vndf, ggx_vndf_pdf, power_heuristic}
 #import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, ResolvedRayHitFull, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 
+fn is_valid(v: vec3<f32>) -> bool {
+    return all(v == clamp(v, vec3(-1e20), vec3(1e20)));
+}
+
+const MAX_BOUNCES = 128u;
+
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
 @group(1) @binding(1) var view_output: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var<uniform> view: View;
@@ -41,7 +47,10 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     var throughput = vec3(1.0);
     var p_bounce = 0.0;
     var bounce_was_perfect_reflection = true;
+    var bounce_count = 0u;
     loop {
+        if bounce_count >= MAX_BOUNCES { break; }
+        bounce_count += 1u;
         let ray = trace_ray(ray_origin, ray_direction, ray_t_min, RAY_T_MAX, RAY_FLAG_NONE);
         if ray.kind != RAY_QUERY_INTERSECTION_NONE {
             let ray_hit = resolve_ray_hit_full(ray);
@@ -80,13 +89,16 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // Update throughput for next bounce
             let brdf = evaluate_brdf(ray_hit.world_normal, wo, next_bounce.wi, ray_hit.material);
             throughput *= brdf / next_bounce.pdf;
+            if !is_valid(throughput) { break; }
 
             // Russian roulette for early termination
-            let p = luminance(throughput);
+            let p = min(1.0, luminance(throughput));
             if rand_f(&rng) > p { break; }
             throughput /= p;
         } else { break; }
     }
+
+    if !is_valid(radiance) { radiance = vec3(0.0); }
 
     // Camera exposure
     radiance *= view.exposure;
@@ -129,7 +141,7 @@ fn importance_sample_next_bounce(wo: vec3<f32>, ray_hit: ResolvedRayHitFull, rng
         wi = wi_tangent.x * T + wi_tangent.y * B + wi_tangent.z * N;
     }
 
-    let diffuse_pdf = dot(wi, ray_hit.world_normal) / PI;
+    let diffuse_pdf = max(0.0, dot(wi, ray_hit.world_normal)) / PI;
     let specular_pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, ray_hit.material.roughness);
     let pdf = (diffuse_weight * diffuse_pdf) + (specular_weight * specular_pdf);
 
@@ -148,7 +160,7 @@ fn brdf_pdf(wo: vec3<f32>, wi: vec3<f32>, ray_hit: ResolvedRayHitFull) -> f32 {
     let wo_tangent = vec3(dot(wo, T), dot(wo, B), dot(wo, N));
     let wi_tangent = vec3(dot(wi, T), dot(wi, B), dot(wi, N));
 
-    let diffuse_pdf = wi_tangent.z / PI;
+    let diffuse_pdf = max(0.0, wi_tangent.z) / PI;
     let specular_pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, ray_hit.material.roughness);
     let pdf = (diffuse_weight * diffuse_pdf) + (specular_weight * specular_pdf);
     return pdf;
