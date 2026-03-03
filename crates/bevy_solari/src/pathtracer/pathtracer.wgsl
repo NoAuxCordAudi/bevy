@@ -9,6 +9,9 @@ enable wgpu_ray_query;
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, sample_ggx_vndf, ggx_vndf_pdf, power_heuristic}
 #import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, ResolvedRayHitFull, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 
+/// Checks whether a vec3 contains only finite, non-NaN values within a
+/// reasonable magnitude. Used as a safety check to discard degenerate
+/// radiance or throughput values that could corrupt the accumulation buffer.
 fn is_valid(v: vec3<f32>) -> bool {
     return all(v == clamp(v, vec3(-1e20), vec3(1e20)));
 }
@@ -19,6 +22,26 @@ const MAX_BOUNCES = 128u;
 @group(1) @binding(1) var view_output: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var<uniform> view: View;
 
+/// Main compute shader entry point – one invocation per pixel.
+///
+/// Each invocation traces a single camera ray through the scene and
+/// progressively accumulates the result into `accumulation_texture` using a
+/// running average. The high-level algorithm:
+///
+///  1. Load the previous accumulated color and sample count from the
+///     accumulation texture.
+///  2. Generate a jittered sub-pixel camera ray for anti-aliasing.
+///  3. Perform a path-tracing loop (up to `MAX_BOUNCES`):
+///     a. Cast a ray against the scene TLAS.
+///     b. On hit, evaluate emissive contribution with MIS weighting.
+///     c. Sample direct lighting (next-event estimation) with MIS for
+///        non-mirror surfaces.
+///     d. Importance-sample the BRDF to pick the next bounce direction.
+///     e. Apply Russian roulette for unbiased early termination.
+///  4. Apply camera exposure and blend the new sample into the running
+///     average.
+///  5. Write the updated accumulation value and the current result to the
+///     view output.
 @compute @workgroup_size(8, 8, 1)
 fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     if any(global_id.xy >= vec2u(view.viewport.zw)) {
@@ -109,12 +132,34 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     textureStore(view_output, global_id.xy, vec4(new_color, 1.0));
 }
 
+/// Result of importance-sampling the BRDF at a surface hit point.
 struct NextBounce {
+    /// The sampled outgoing light direction (toward the next bounce).
     wi: vec3<f32>,
+    /// Probability density of having sampled `wi` under the mixed
+    /// diffuse/specular sampling strategy. Set to 1.0 for perfect mirrors.
     pdf: f32,
+    /// `true` when the surface is a perfect mirror (roughness ≤ threshold
+    /// and fully metallic), meaning no direct-lighting MIS is needed for
+    /// emissive hits on the next bounce.
     perfectly_specular_bounce: bool,
 }
 
+/// Importance-samples a new bounce direction from the material BRDF at the
+/// given hit point.
+///
+/// For perfect mirrors (roughness ≤ `MIRROR_ROUGHNESS_THRESHOLD` and fully
+/// metallic) the function returns a deterministic mirror reflection with
+/// `pdf = 1.0`.
+///
+/// For all other materials a mixed sampling strategy is used:
+///  - With probability `diffuse_weight`, a cosine-weighted hemisphere sample
+///    is drawn (good for diffuse lobes).
+///  - Otherwise, a GGX VNDF (visible normal distribution function) sample is
+///    drawn (good for specular lobes).
+///
+/// The combined PDF is the weighted sum of both strategies so it can be used
+/// for MIS with direct-light sampling.
 fn importance_sample_next_bounce(wo: vec3<f32>, ray_hit: ResolvedRayHitFull, rng: ptr<function, u32>) -> NextBounce {
     let is_perfectly_specular = ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
     if is_perfectly_specular {
@@ -148,6 +193,15 @@ fn importance_sample_next_bounce(wo: vec3<f32>, ray_hit: ResolvedRayHitFull, rng
     return NextBounce(wi, pdf, false);
 }
 
+/// Evaluates the probability density of sampling direction `wi` given
+/// outgoing direction `wo` at the surface described by `ray_hit`, under the
+/// same mixed diffuse/specular strategy used by
+/// `importance_sample_next_bounce`.
+///
+/// This is needed for multiple importance sampling (MIS): when a light
+/// sample direction is chosen by direct-light sampling, we need to know what
+/// PDF the BRDF sampling strategy would have assigned to that same direction
+/// in order to compute the MIS weight via the power heuristic.
 fn brdf_pdf(wo: vec3<f32>, wi: vec3<f32>, ray_hit: ResolvedRayHitFull) -> f32 {
     let diffuse_weight = mix(mix(0.4, 0.9, ray_hit.material.perceptual_roughness), 0.0, ray_hit.material.metallic);
     let specular_weight = 1.0 - diffuse_weight;

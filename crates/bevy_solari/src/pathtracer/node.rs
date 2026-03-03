@@ -15,14 +15,35 @@ use bevy_render::{
 };
 use bevy_utils::default;
 
-/// Resource holding the pathtracer pipeline configuration.
+/// Resource that stores the GPU compute pipeline and bind-group layout used by
+/// the pathtracer.
+///
+/// Created once during render startup by [`init_pathtracer_pipelines`] and
+/// consumed each frame by the [`pathtracer`] system when dispatching the
+/// compute pass.
 #[derive(Resource)]
 pub struct PathtracerPipelines {
+    /// Layout describing the pathtracer-specific bindings (accumulation
+    /// texture, view output texture, and view uniform buffer).
     bind_group_layout: BindGroupLayoutDescriptor,
+    /// Handle to the cached compute pipeline compiled from `pathtracer.wgsl`.
     pipeline: CachedComputePipelineId,
 }
 
-/// Initializes the pathtracer pipelines at render startup.
+/// One-shot startup system that creates the pathtracer compute pipeline and
+/// its bind-group layout, then inserts them as the [`PathtracerPipelines`]
+/// resource.
+///
+/// The bind-group layout contains three entries (all in `COMPUTE` stage):
+/// 1. **Accumulation texture** (`Rgba32Float`, read-write) – running average
+///    of all samples accumulated so far.
+/// 2. **View output texture** (HDR, write-only) – the final image written to
+///    the camera's view target for presentation.
+/// 3. **View uniform buffer** – camera matrices, viewport size, exposure, etc.
+///
+/// The compute pipeline references two bind groups: bind group 0 is the
+/// shared [`RaytracingSceneBindings`] (TLAS, meshes, materials, lights) and
+/// bind group 1 is the layout defined here.
 pub fn init_pathtracer_pipelines(
     mut commands: Commands,
     pipeline_cache: Res<PipelineCache>,
@@ -60,6 +81,22 @@ pub fn init_pathtracer_pipelines(
     });
 }
 
+/// Per-frame render system that dispatches the pathtracer compute shader.
+///
+/// This system runs after the main render pass in the [`Core3d`] schedule.
+/// For each camera that has a [`Pathtracer`] component it:
+///
+/// 1. Creates a bind group with the accumulation texture, view output, and
+///    view uniforms.
+/// 2. If [`Pathtracer::reset`] is `true`, clears the accumulation texture so
+///    sampling starts fresh.
+/// 3. Begins a compute pass, binds the scene and pathtracer bind groups, and
+///    dispatches enough 8×8 workgroups to cover the entire viewport.
+///
+/// The system exits early (no-op) if:
+/// - The [`PathtracerPipelines`] resource is missing (GPU features unsupported).
+/// - The compute pipeline has not finished compiling yet.
+/// - The scene bind group or view uniforms are not yet available.
 pub fn pathtracer(
     view: ViewQuery<(
         &Pathtracer,

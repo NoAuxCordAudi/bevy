@@ -24,10 +24,23 @@ use tracing::warn;
 pub struct PathtracingPlugin;
 
 impl Plugin for PathtracingPlugin {
+    /// Embeds the `pathtracer.wgsl` shader as an asset so it can be loaded
+    /// at runtime without requiring an external file on disk.
     fn build(&self, app: &mut App) {
         embedded_asset!(app, "pathtracer.wgsl");
     }
 
+    /// Registers the pathtracer's render systems on the [`RenderApp`].
+    ///
+    /// Before registering anything, this checks that the GPU supports the
+    /// required ray-tracing features (e.g. hardware ray queries). If the
+    /// features are missing, a warning is logged and the plugin is skipped.
+    ///
+    /// The following systems are registered:
+    /// - [`init_pathtracer_pipelines`] – creates the compute pipeline (runs once at startup).
+    /// - [`extract_pathtracer`] – copies [`Pathtracer`] component data from the main world to the render world each frame.
+    /// - [`prepare_pathtracer_accumulation_texture`] – allocates / resizes the accumulation texture to match the viewport.
+    /// - [`pathtracer`] – dispatches the GPU compute pass that performs the actual path tracing, running after the main pass.
     fn finish(&self, app: &mut App) {
         let render_app = app.sub_app_mut(RenderApp);
 
@@ -52,9 +65,23 @@ impl Plugin for PathtracingPlugin {
     }
 }
 
+/// Marker component that enables path tracing for the camera it is attached to.
+///
+/// When present on a camera entity, the pathtracer will progressively
+/// accumulate samples each frame and write the result into the camera's
+/// view target. The accumulation buffer is preserved across frames so the
+/// image converges over time.
+///
+/// Requires the [`Hdr`] component (added automatically via `#[require]`)
+/// because the pathtracer outputs high-dynamic-range radiance values.
 #[derive(Component, Reflect, Default, Clone)]
 #[reflect(Component, Default, Clone)]
 #[require(Hdr)]
 pub struct Pathtracer {
+    /// When `true`, the accumulation buffer is cleared before the next frame,
+    /// discarding all previously accumulated samples. This is set
+    /// automatically when the camera's [`GlobalTransform`] changes (see
+    /// [`extract_pathtracer`]), but can also be set manually to force a reset
+    /// (e.g. after a scene change).
     pub reset: bool,
 }
