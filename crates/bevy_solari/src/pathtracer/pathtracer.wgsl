@@ -152,13 +152,19 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let old_m2 = textureLoad(variance_texture, global_id.xy).r;
     let new_m2 = old_m2 + (lum - old_mean_lum) * (lum - new_mean_lum);
 
-    // Convergence: relative standard error of the mean
+    // Convergence: standard error of the mean with absolute floor for dark pixels
     var final_sample_count = new_sample_count;
     let n = f32(new_sample_count);
     if new_sample_count >= settings.min_samples && settings.convergence_threshold > 0.0 {
-        let variance = new_m2 / (n - 1.0);
-        let rse = sqrt(variance / n) / max(new_mean_lum, 1e-6);
-        if rse < settings.convergence_threshold {
+        let variance = max(new_m2 / (n - 1.0), 0.0);
+        let standard_error = sqrt(variance / n);
+        let threshold = settings.convergence_threshold;
+        // Bright pixels: relative standard error (SE < threshold * mean)
+        // Dark pixels: absolute standard error (SE < threshold * absolute_floor)
+        // The absolute_floor prevents premature convergence of near-black pixels
+        let absolute_floor = 0.01;
+        let converged = standard_error < threshold * max(new_mean_lum, absolute_floor);
+        if converged {
             final_sample_count = settings.max_samples;
         }
     }
