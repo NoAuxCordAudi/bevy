@@ -2,7 +2,7 @@ enable wgpu_ray_query;
 
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_pbr::pbr_functions::calculate_tbn_mikktspace
-#import bevy_pbr::utils::{rand_f, rand_vec2f, sample_cosine_hemisphere}
+#import bevy_pbr::utils::{rand_f, rand_vec2f, sample_cosine_hemisphere, halton_2d}
 #import bevy_render::maths::PI
 #import bevy_render::view::View
 #import bevy_solari::brdf::evaluate_brdf
@@ -57,7 +57,7 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Shoot the first ray from the camera
     let pixel_center = vec2<f32>(global_id.xy) + 0.5;
-    let jitter = rand_vec2f(&rng) - 0.5;
+    let jitter = halton_2d(u32(old_color.a)) - 0.5;
     let pixel_uv = (pixel_center + jitter) / view.viewport.zw;
     let pixel_ndc = (pixel_uv * 2.0) - 1.0;
     let primary_ray_target = view.world_from_clip * vec4(pixel_ndc.x, -pixel_ndc.y, 1.0, 1.0);

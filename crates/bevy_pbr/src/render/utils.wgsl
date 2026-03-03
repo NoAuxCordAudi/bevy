@@ -81,6 +81,34 @@ fn hammersley_2d(i: u32, n: u32) -> vec2f {
     return vec2f(f32(i) * inv_n, vdc);
 }
 
+// Radical inverse in base 3 (digit-by-digit reversal).
+// Used as the second dimension of `halton_2d`.
+fn radical_inverse_base3(n: u32) -> f32 {
+    var val = n;
+    var result = 0.0;
+    var inv_base = 1.0 / 3.0;
+    var inv_base_n = inv_base;
+    while val > 0u {
+        let digit = val % 3u;
+        result += f32(digit) * inv_base_n;
+        val /= 3u;
+        inv_base_n *= inv_base;
+    }
+    return result;
+}
+
+// Halton low-discrepancy sequence (base 2, base 3).
+// Unlike white noise (e.g. `rand_vec2f`), the Halton sequence is a
+// quasi-random, low-discrepancy sequence that covers the sample space more
+// evenly over successive indices. This leads to faster convergence and less
+// perceptible noise at the same sample count, which is especially beneficial
+// for progressive rendering techniques like pathtracing pixel jitter.
+fn halton_2d(index: u32) -> vec2f {
+    let base2 = f32(reverseBits(index)) * 2.3283064365386963e-10;
+    let base3 = radical_inverse_base3(index);
+    return vec2f(base2, base3);
+}
+
 // https://www.iryoku.com/next-generation-post-processing-in-call-of-duty-advanced-warfare (slides 120-135)
 // TODO: Use an array here instead of a bunch of constants, once arrays work properly under DX12.
 // NOTE: The names have a final underscore to avoid the following error:
