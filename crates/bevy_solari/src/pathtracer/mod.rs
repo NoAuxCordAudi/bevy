@@ -10,11 +10,12 @@ use bevy_core_pipeline::schedule::{Core3d, Core3dSystems};
 use bevy_ecs::{component::Component, reflect::ReflectComponent, schedule::IntoScheduleConfigs};
 use bevy_reflect::{std_traits::ReflectDefault, Reflect};
 use bevy_render::{
-    renderer::RenderDevice, ExtractSchedule, Render, RenderApp, RenderStartup, RenderSystems,
+    render_resource::ShaderType, renderer::RenderDevice, ExtractSchedule, Render, RenderApp,
+    RenderStartup, RenderSystems,
 };
 use extract::extract_pathtracer;
 use node::{init_pathtracer_pipelines, pathtracer};
-use prepare::prepare_pathtracer_accumulation_texture;
+use prepare::{prepare_pathtracer_accumulation_texture, prepare_pathtracer_settings_buffer};
 use tracing::warn;
 
 /// Non-realtime pathtracing.
@@ -59,13 +60,17 @@ impl Plugin for PathtracingPlugin {
             .add_systems(ExtractSchedule, extract_pathtracer)
             .add_systems(
                 Render,
-                prepare_pathtracer_accumulation_texture.in_set(RenderSystems::PrepareResources),
+                (
+                    prepare_pathtracer_accumulation_texture,
+                    prepare_pathtracer_settings_buffer,
+                )
+                    .in_set(RenderSystems::PrepareResources),
             )
             .add_systems(Core3d, pathtracer.after(Core3dSystems::MainPass));
     }
 }
 
-/// Marker component that enables path tracing for the camera it is attached to.
+/// Component that enables path tracing for the camera it is attached to.
 ///
 /// When present on a camera entity, the pathtracer will progressively
 /// accumulate samples each frame and write the result into the camera's
@@ -74,7 +79,7 @@ impl Plugin for PathtracingPlugin {
 ///
 /// Requires the [`Hdr`] component (added automatically via `#[require]`)
 /// because the pathtracer outputs high-dynamic-range radiance values.
-#[derive(Component, Reflect, Default, Clone)]
+#[derive(Component, Reflect, Clone)]
 #[reflect(Component, Default, Clone)]
 #[require(Hdr)]
 pub struct Pathtracer {
@@ -84,4 +89,32 @@ pub struct Pathtracer {
     /// [`extract_pathtracer`]), but can also be set manually to force a reset
     /// (e.g. after a scene change).
     pub reset: bool,
+    /// Minimum number of samples per pixel before convergence testing begins.
+    pub min_samples: u32,
+    /// Maximum number of samples per pixel. Pixels stop accumulating after
+    /// reaching this count regardless of convergence.
+    pub max_samples: u32,
+    /// Relative standard error threshold for per-pixel convergence. A pixel
+    /// is considered converged when `sqrt(variance / n) / mean < threshold`.
+    /// Set to `0.0` to disable convergence (all pixels run to `max_samples`).
+    pub convergence_threshold: f32,
+}
+
+impl Default for Pathtracer {
+    fn default() -> Self {
+        Self {
+            reset: false,
+            min_samples: 64,
+            max_samples: 4096,
+            convergence_threshold: 0.01,
+        }
+    }
+}
+
+/// GPU-side uniform buffer matching the convergence settings in [`Pathtracer`].
+#[derive(ShaderType)]
+pub(crate) struct PathtracerSettingsUniform {
+    pub min_samples: u32,
+    pub max_samples: u32,
+    pub convergence_threshold: f32,
 }

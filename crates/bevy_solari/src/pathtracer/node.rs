@@ -1,4 +1,7 @@
-use super::{prepare::PathtracerAccumulationTexture, Pathtracer};
+use super::{
+    prepare::{PathtracerAccumulationTexture, PathtracerSettingsBuffer, PathtracerVarianceTexture},
+    Pathtracer, PathtracerSettingsUniform,
+};
 use crate::scene::RaytracingSceneBindings;
 use bevy_asset::{load_embedded_asset, AssetServer};
 use bevy_ecs::{prelude::*, resource::Resource, system::Commands};
@@ -61,6 +64,8 @@ pub fn init_pathtracer_pipelines(
                     StorageTextureAccess::WriteOnly,
                 ),
                 uniform_buffer::<ViewUniform>(true),
+                texture_storage_2d(TextureFormat::R32Float, StorageTextureAccess::ReadWrite),
+                uniform_buffer::<PathtracerSettingsUniform>(false),
             ),
         ),
     );
@@ -101,6 +106,8 @@ pub fn pathtracer(
     view: ViewQuery<(
         &Pathtracer,
         &PathtracerAccumulationTexture,
+        &PathtracerVarianceTexture,
+        &PathtracerSettingsBuffer,
         &ExtractedCamera,
         &ViewTarget,
         &ViewUniformOffset,
@@ -112,18 +119,32 @@ pub fn pathtracer(
     render_device: Res<RenderDevice>,
     mut ctx: RenderContext,
 ) {
-    let (pathtracer_settings, accumulation_texture, camera, view_target, view_uniform_offset) =
-        view.into_inner();
+    let (
+        pathtracer_settings,
+        accumulation_texture,
+        variance_texture,
+        settings_buffer,
+        camera,
+        view_target,
+        view_uniform_offset,
+    ) = view.into_inner();
 
     let Some(pathtracer_pipelines) = pathtracer_pipelines else {
         return;
     };
 
-    let (Some(pipeline), Some(scene_bind_group), Some(viewport), Some(view_uniforms_binding)) = (
+    let (
+        Some(pipeline),
+        Some(scene_bind_group),
+        Some(viewport),
+        Some(view_uniforms_binding),
+        Some(settings_binding),
+    ) = (
         pipeline_cache.get_compute_pipeline(pathtracer_pipelines.pipeline),
         &scene_bindings.bind_group,
         camera.physical_viewport_size,
         view_uniforms.uniforms.binding(),
+        settings_buffer.0.binding(),
     ) else {
         return;
     };
@@ -135,6 +156,8 @@ pub fn pathtracer(
             &accumulation_texture.0.default_view,
             view_target.get_unsampled_color_attachment().view,
             view_uniforms_binding,
+            &variance_texture.0.default_view,
+            settings_binding,
         )),
     );
 
@@ -143,6 +166,10 @@ pub fn pathtracer(
     if pathtracer_settings.reset {
         command_encoder.clear_texture(
             &accumulation_texture.0.texture,
+            &ImageSubresourceRange::default(),
+        );
+        command_encoder.clear_texture(
+            &variance_texture.0.texture,
             &ImageSubresourceRange::default(),
         );
     }

@@ -18,9 +18,17 @@ fn is_valid(v: vec3<f32>) -> bool {
 
 const MAX_BOUNCES = 128u;
 
+struct PathtracerSettings {
+    min_samples: u32,
+    max_samples: u32,
+    convergence_threshold: f32,
+}
+
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
 @group(1) @binding(1) var view_output: texture_storage_2d<rgba16float, write>;
 @group(1) @binding(2) var<uniform> view: View;
+@group(1) @binding(3) var variance_texture: texture_storage_2d<r32float, read_write>;
+@group(1) @binding(4) var<uniform> settings: PathtracerSettings;
 
 /// Main compute shader entry point – one invocation per pixel.
 ///
@@ -49,6 +57,13 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     }
 
     let old_color = textureLoad(accumulation_texture, global_id.xy);
+
+    // Early-out for converged / max-sample pixels
+    let sample_count = u32(old_color.a);
+    if sample_count >= settings.max_samples {
+        textureStore(view_output, global_id.xy, vec4(old_color.rgb, 1.0));
+        return;
+    }
 
     // Setup RNG
     let pixel_index = global_id.x + global_id.y * u32(view.viewport.z);
@@ -128,7 +143,28 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     // Accumulation over time via running average
     let new_color = mix(old_color.rgb, radiance, 1.0 / (old_color.a + 1.0));
-    textureStore(accumulation_texture, global_id.xy, vec4(new_color, old_color.a + 1.0));
+    let new_sample_count = sample_count + 1u;
+
+    // Welford's online variance update (on luminance)
+    let lum = luminance(radiance);
+    let old_mean_lum = luminance(old_color.rgb);
+    let new_mean_lum = luminance(new_color);
+    let old_m2 = textureLoad(variance_texture, global_id.xy).r;
+    let new_m2 = old_m2 + (lum - old_mean_lum) * (lum - new_mean_lum);
+
+    // Convergence: relative standard error of the mean
+    var final_sample_count = new_sample_count;
+    let n = f32(new_sample_count);
+    if new_sample_count >= settings.min_samples && settings.convergence_threshold > 0.0 {
+        let variance = new_m2 / (n - 1.0);
+        let rse = sqrt(variance / n) / max(new_mean_lum, 1e-6);
+        if rse < settings.convergence_threshold {
+            final_sample_count = settings.max_samples;
+        }
+    }
+
+    textureStore(variance_texture, global_id.xy, vec4(new_m2, 0.0, 0.0, 0.0));
+    textureStore(accumulation_texture, global_id.xy, vec4(new_color, f32(final_sample_count)));
     textureStore(view_output, global_id.xy, vec4(new_color, 1.0));
 }
 

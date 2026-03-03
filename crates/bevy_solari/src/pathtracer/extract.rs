@@ -1,4 +1,7 @@
-use super::{prepare::PathtracerAccumulationTexture, Pathtracer};
+use super::{
+    prepare::{PathtracerAccumulationTexture, PathtracerVarianceTexture},
+    Pathtracer,
+};
 use bevy_camera::Camera;
 use bevy_ecs::{
     change_detection::DetectChanges,
@@ -43,7 +46,8 @@ pub fn extract_pathtracer(
             pathtracer.reset |= global_transform.is_changed();
             entity_commands.insert(pathtracer);
         } else {
-            entity_commands.remove::<(Pathtracer, PathtracerAccumulationTexture)>();
+            entity_commands
+                .remove::<(Pathtracer, PathtracerAccumulationTexture, PathtracerVarianceTexture)>();
         }
     }
 }
