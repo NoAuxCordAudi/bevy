@@ -40,15 +40,12 @@ pub const LIGHT_TILE_SAMPLES_PER_BLOCK: u64 = 1024;
 /// Amount of entries in the world cache (must be a power of 2, and >= 2^10)
 pub const WORLD_CACHE_SIZE: u64 = 2u64.pow(20);
 
-/// Internal rendering resources used for Solari lighting.
+/// Fixed-size rendering resources for Solari lighting that do not depend on viewport size.
+/// These are created once per view and never recreated on resize.
 #[derive(Component)]
-pub struct SolariLightingResources {
+pub struct SolariLightingFixedResources {
     pub light_tile_samples: Buffer,
     pub light_tile_resolved_samples: Buffer,
-    pub di_reservoirs_a: TextureView,
-    pub di_reservoirs_b: TextureView,
-    pub gi_reservoirs_a: Buffer,
-    pub gi_reservoirs_b: Buffer,
     pub world_cache_checksums: Buffer,
     pub world_cache_life: Buffer,
     pub world_cache_radiance: Buffer,
@@ -60,6 +57,15 @@ pub struct SolariLightingResources {
     pub world_cache_active_cell_indices: Buffer,
     pub world_cache_active_cells_count: Buffer,
     pub world_cache_active_cells_dispatch: Buffer,
+}
+
+/// View-dependent rendering resources for Solari lighting that must be recreated on viewport resize.
+#[derive(Component)]
+pub struct SolariLightingResources {
+    pub di_reservoirs_a: TextureView,
+    pub di_reservoirs_b: TextureView,
+    pub gi_reservoirs_a: Buffer,
+    pub gi_reservoirs_b: Buffer,
     pub view_size: UVec2,
 }
 
@@ -68,6 +74,7 @@ pub fn prepare_solari_lighting_resources(
         (
             Entity,
             &ExtractedCamera,
+            Option<&SolariLightingFixedResources>,
             Option<&SolariLightingResources>,
             Option<&MainPassResolutionOverride>,
         ),
@@ -77,6 +84,7 @@ pub fn prepare_solari_lighting_resources(
         (
             Entity,
             &ExtractedCamera,
+            Option<&SolariLightingFixedResources>,
             Option<&SolariLightingResources>,
             Option<&MainPassResolutionOverride>,
             Has<Dlss<DlssRayReconstructionFeature>>,
@@ -88,10 +96,17 @@ pub fn prepare_solari_lighting_resources(
 ) {
     for query_item in &query {
         #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
-        let (entity, camera, solari_lighting_resources, resolution_override) = query_item;
-        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
-        let (entity, camera, solari_lighting_resources, resolution_override, has_dlss_rr) =
+        let (entity, camera, fixed_resources, solari_lighting_resources, resolution_override) =
             query_item;
+        #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
+        let (
+            entity,
+            camera,
+            fixed_resources,
+            solari_lighting_resources,
+            resolution_override,
+            has_dlss_rr,
+        ) = query_item;
 
         let Some(mut view_size) = camera.physical_viewport_size else {
             continue;
@@ -100,25 +115,126 @@ pub fn prepare_solari_lighting_resources(
             view_size = *resolution_override;
         }
 
+        // Create fixed-size resources once (world cache + light tiles)
+        if fixed_resources.is_none() {
+            let light_tile_samples = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_light_tile_samples"),
+                size: LIGHT_TILE_BLOCKS * LIGHT_TILE_SAMPLES_PER_BLOCK * LIGHT_SAMPLE_STRUCT_SIZE,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let light_tile_resolved_samples = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_light_tile_resolved_samples"),
+                size: LIGHT_TILE_BLOCKS
+                    * LIGHT_TILE_SAMPLES_PER_BLOCK
+                    * RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let world_cache_checksums = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_world_cache_checksums"),
+                size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let world_cache_life = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_world_cache_life"),
+                size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let world_cache_radiance = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_world_cache_radiance"),
+                size: WORLD_CACHE_SIZE * size_of::<[f32; 4]>() as u64,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let world_cache_geometry_data = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_world_cache_geometry_data"),
+                size: WORLD_CACHE_SIZE * size_of::<[f32; 8]>() as u64,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let world_cache_luminance_deltas = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_world_cache_luminance_deltas"),
+                size: WORLD_CACHE_SIZE * size_of::<f32>() as u64,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let world_cache_active_cells_new_radiance =
+                render_device.create_buffer(&BufferDescriptor {
+                    label: Some("solari_lighting_world_cache_active_cells_new_radiance"),
+                    size: WORLD_CACHE_SIZE * size_of::<[f32; 4]>() as u64,
+                    usage: BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+
+            let world_cache_a = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_world_cache_a"),
+                size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+            let world_cache_b = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_world_cache_b"),
+                size: 1024 * size_of::<u32>() as u64,
+                usage: BufferUsages::STORAGE,
+                mapped_at_creation: false,
+            });
+
+            let world_cache_active_cell_indices =
+                render_device.create_buffer(&BufferDescriptor {
+                    label: Some("solari_lighting_world_cache_active_cell_indices"),
+                    size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
+                    usage: BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+
+            let world_cache_active_cells_count = render_device.create_buffer(&BufferDescriptor {
+                label: Some("solari_lighting_world_cache_active_cells_count"),
+                size: size_of::<u32>() as u64,
+                usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
+                mapped_at_creation: false,
+            });
+
+            let world_cache_active_cells_dispatch =
+                render_device.create_buffer(&BufferDescriptor {
+                    label: Some("solari_lighting_world_cache_active_cells_dispatch"),
+                    size: size_of::<[u32; 3]>() as u64,
+                    usage: BufferUsages::INDIRECT | BufferUsages::STORAGE,
+                    mapped_at_creation: false,
+                });
+
+            commands
+                .entity(entity)
+                .insert(SolariLightingFixedResources {
+                    light_tile_samples,
+                    light_tile_resolved_samples,
+                    world_cache_checksums,
+                    world_cache_life,
+                    world_cache_radiance,
+                    world_cache_geometry_data,
+                    world_cache_luminance_deltas,
+                    world_cache_active_cells_new_radiance,
+                    world_cache_a,
+                    world_cache_b,
+                    world_cache_active_cell_indices,
+                    world_cache_active_cells_count,
+                    world_cache_active_cells_dispatch,
+                });
+        }
+
+        // Only recreate view-dependent resources when viewport size changes
         if solari_lighting_resources.map(|r| r.view_size) == Some(view_size) {
             continue;
         }
-
-        let light_tile_samples = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_light_tile_samples"),
-            size: LIGHT_TILE_BLOCKS * LIGHT_TILE_SAMPLES_PER_BLOCK * LIGHT_SAMPLE_STRUCT_SIZE,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let light_tile_resolved_samples = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_light_tile_resolved_samples"),
-            size: LIGHT_TILE_BLOCKS
-                * LIGHT_TILE_SAMPLES_PER_BLOCK
-                * RESOLVED_LIGHT_SAMPLE_STRUCT_SIZE,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
 
         let di_reservoirs = |name| {
             render_device
@@ -148,101 +264,11 @@ pub fn prepare_solari_lighting_resources(
         let gi_reservoirs_a = gi_reservoirs("solari_lighting_gi_reservoirs_a");
         let gi_reservoirs_b = gi_reservoirs("solari_lighting_gi_reservoirs_b");
 
-        let world_cache_checksums = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_checksums"),
-            size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let world_cache_life = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_life"),
-            size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let world_cache_radiance = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_radiance"),
-            size: WORLD_CACHE_SIZE * size_of::<[f32; 4]>() as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let world_cache_geometry_data = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_geometry_data"),
-            size: WORLD_CACHE_SIZE * size_of::<[f32; 8]>() as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let world_cache_luminance_deltas = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_luminance_deltas"),
-            size: WORLD_CACHE_SIZE * size_of::<f32>() as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let world_cache_active_cells_new_radiance =
-            render_device.create_buffer(&BufferDescriptor {
-                label: Some("solari_lighting_world_cache_active_cells_new_radiance"),
-                size: WORLD_CACHE_SIZE * size_of::<[f32; 4]>() as u64,
-                usage: BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            });
-
-        let world_cache_a = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_a"),
-            size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-        let world_cache_b = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_b"),
-            size: 1024 * size_of::<u32>() as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let world_cache_active_cell_indices = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_active_cell_indices"),
-            size: WORLD_CACHE_SIZE * size_of::<u32>() as u64,
-            usage: BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
-        let world_cache_active_cells_count = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_active_cells_count"),
-            size: size_of::<u32>() as u64,
-            usage: BufferUsages::STORAGE | BufferUsages::COPY_SRC,
-            mapped_at_creation: false,
-        });
-
-        let world_cache_active_cells_dispatch = render_device.create_buffer(&BufferDescriptor {
-            label: Some("solari_lighting_world_cache_active_cells_dispatch"),
-            size: size_of::<[u32; 3]>() as u64,
-            usage: BufferUsages::INDIRECT | BufferUsages::STORAGE,
-            mapped_at_creation: false,
-        });
-
         commands.entity(entity).insert(SolariLightingResources {
-            light_tile_samples,
-            light_tile_resolved_samples,
             di_reservoirs_a,
             di_reservoirs_b,
             gi_reservoirs_a,
             gi_reservoirs_b,
-            world_cache_checksums,
-            world_cache_life,
-            world_cache_radiance,
-            world_cache_geometry_data,
-            world_cache_luminance_deltas,
-            world_cache_active_cells_new_radiance,
-            world_cache_a,
-            world_cache_b,
-            world_cache_active_cell_indices,
-            world_cache_active_cells_count,
-            world_cache_active_cells_dispatch,
             view_size,
         });
 

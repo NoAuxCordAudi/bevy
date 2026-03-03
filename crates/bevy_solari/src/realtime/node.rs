@@ -1,5 +1,7 @@
 use super::{
-    prepare::{SolariLightingResources, LIGHT_TILE_BLOCKS, WORLD_CACHE_SIZE},
+    prepare::{
+        SolariLightingFixedResources, SolariLightingResources, LIGHT_TILE_BLOCKS, WORLD_CACHE_SIZE,
+    },
     SolariLighting,
 };
 use crate::scene::RaytracingSceneBindings;
@@ -57,6 +59,7 @@ pub struct SolariLightingPipelines {
 #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
 type SolariLightingViewQuery = (
     &'static SolariLighting,
+    &'static SolariLightingFixedResources,
     &'static SolariLightingResources,
     &'static ViewTarget,
     &'static ViewPrepassTextures,
@@ -67,6 +70,7 @@ type SolariLightingViewQuery = (
 #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
 type SolariLightingViewQuery = (
     &'static SolariLighting,
+    &'static SolariLightingFixedResources,
     &'static SolariLightingResources,
     &'static ViewTarget,
     &'static ViewPrepassTextures,
@@ -89,6 +93,7 @@ pub fn solari_lighting(
     #[cfg(any(not(feature = "dlss"), feature = "force_disable_dlss"))]
     let (
         solari_lighting,
+        solari_lighting_fixed_resources,
         solari_lighting_resources,
         view_target,
         view_prepass_textures,
@@ -99,6 +104,7 @@ pub fn solari_lighting(
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
     let (
         solari_lighting,
+        solari_lighting_fixed_resources,
         solari_lighting_resources,
         view_target,
         view_prepass_textures,
@@ -179,18 +185,19 @@ pub fn solari_lighting(
 
     let view_target_attachment = view_target.get_unsampled_color_attachment();
 
-    let s = solari_lighting_resources;
+    let f = solari_lighting_fixed_resources;
+    let v = solari_lighting_resources;
     let bind_group = render_device.create_bind_group(
         "solari_lighting_bind_group",
         &pipeline_cache.get_bind_group_layout(&pipelines.bind_group_layout),
         &BindGroupEntries::sequential((
             view_target_attachment.view,
-            s.light_tile_samples.as_entire_binding(),
-            s.light_tile_resolved_samples.as_entire_binding(),
-            &s.di_reservoirs_a,
-            &s.di_reservoirs_b,
-            s.gi_reservoirs_a.as_entire_binding(),
-            s.gi_reservoirs_b.as_entire_binding(),
+            f.light_tile_samples.as_entire_binding(),
+            f.light_tile_resolved_samples.as_entire_binding(),
+            &v.di_reservoirs_a,
+            &v.di_reservoirs_b,
+            v.gi_reservoirs_a.as_entire_binding(),
+            v.gi_reservoirs_b.as_entire_binding(),
             gbuffer,
             depth_buffer,
             motion_vectors,
@@ -198,23 +205,23 @@ pub fn solari_lighting(
             previous_depth_buffer,
             view_uniforms_binding,
             previous_view_uniforms_binding,
-            s.world_cache_checksums.as_entire_binding(),
-            s.world_cache_life.as_entire_binding(),
-            s.world_cache_radiance.as_entire_binding(),
-            s.world_cache_geometry_data.as_entire_binding(),
-            s.world_cache_luminance_deltas.as_entire_binding(),
-            s.world_cache_active_cells_new_radiance.as_entire_binding(),
-            s.world_cache_a.as_entire_binding(),
-            s.world_cache_b.as_entire_binding(),
-            s.world_cache_active_cell_indices.as_entire_binding(),
-            s.world_cache_active_cells_count.as_entire_binding(),
+            f.world_cache_checksums.as_entire_binding(),
+            f.world_cache_life.as_entire_binding(),
+            f.world_cache_radiance.as_entire_binding(),
+            f.world_cache_geometry_data.as_entire_binding(),
+            f.world_cache_luminance_deltas.as_entire_binding(),
+            f.world_cache_active_cells_new_radiance.as_entire_binding(),
+            f.world_cache_a.as_entire_binding(),
+            f.world_cache_b.as_entire_binding(),
+            f.world_cache_active_cell_indices.as_entire_binding(),
+            f.world_cache_active_cells_count.as_entire_binding(),
         )),
     );
     let bind_group_world_cache_active_cells_dispatch = render_device.create_bind_group(
         "solari_lighting_bind_group_world_cache_active_cells_dispatch",
         &pipeline_cache
             .get_bind_group_layout(&pipelines.bind_group_layout_world_cache_active_cells_dispatch),
-        &BindGroupEntries::single(s.world_cache_active_cells_dispatch.as_entire_binding()),
+        &BindGroupEntries::single(f.world_cache_active_cells_dispatch.as_entire_binding()),
     );
 
     #[cfg(all(feature = "dlss", not(feature = "force_disable_dlss")))]
@@ -257,8 +264,8 @@ pub fn solari_lighting(
         timestamp_writes: None,
     });
 
-    let dx = solari_lighting_resources.view_size.x.div_ceil(8);
-    let dy = solari_lighting_resources.view_size.y.div_ceil(8);
+    let dx = v.view_size.x.div_ceil(8);
+    let dy = v.view_size.y.div_ceil(8);
 
     pass.set_bind_group(0, scene_bind_group, &[]);
     pass.set_bind_group(
@@ -310,7 +317,7 @@ pub fn solari_lighting(
         bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
     );
     pass.dispatch_workgroups_indirect(
-        &solari_lighting_resources.world_cache_active_cells_dispatch,
+        &f.world_cache_active_cells_dispatch,
         0,
     );
 
@@ -320,13 +327,13 @@ pub fn solari_lighting(
         bytemuck::cast_slice(&[frame_index, solari_lighting.reset as u32]),
     );
     pass.dispatch_workgroups_indirect(
-        &solari_lighting_resources.world_cache_active_cells_dispatch,
+        &f.world_cache_active_cells_dispatch,
         0,
     );
 
     pass.set_pipeline(blend_new_world_cache_samples_pipeline);
     pass.dispatch_workgroups_indirect(
-        &solari_lighting_resources.world_cache_active_cells_dispatch,
+        &f.world_cache_active_cells_dispatch,
         0,
     );
 
@@ -385,7 +392,7 @@ pub fn solari_lighting(
 
     diagnostics.record_u32(
         ctx.command_encoder(),
-        &s.world_cache_active_cells_count.slice(..),
+        &f.world_cache_active_cells_count.slice(..),
         "solari_lighting/world_cache_active_cells_count",
     );
 }

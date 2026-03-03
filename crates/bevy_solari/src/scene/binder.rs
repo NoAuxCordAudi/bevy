@@ -32,6 +32,16 @@ pub struct RaytracingSceneBindings {
     pub bind_group: Option<BindGroup>,
     pub bind_group_layout: BindGroupLayoutDescriptor,
     previous_frame_light_entities: Vec<Entity>,
+    materials: StorageBufferList<GpuMaterial>,
+    transforms: StorageBufferList<Mat4>,
+    previous_frame_transforms: StorageBufferList<Mat4>,
+    geometry_ids: StorageBufferList<GpuInstanceGeometryIds>,
+    material_ids: StorageBufferList<u32>,
+    light_sources: StorageBufferList<GpuLightSource>,
+    directional_lights: StorageBufferList<GpuDirectionalLight>,
+    previous_frame_light_id_translations: StorageBufferList<u32>,
+    tlas: Option<Tlas>,
+    tlas_max_instances: u32,
 }
 
 pub fn prepare_raytracing_scene_bindings(
@@ -53,13 +63,12 @@ pub fn prepare_raytracing_scene_bindings(
     render_queue: Res<RenderQueue>,
     mut raytracing_scene_bindings: ResMut<RaytracingSceneBindings>,
 ) {
-    raytracing_scene_bindings.bind_group = None;
+    let s = &mut *raytracing_scene_bindings;
+    s.bind_group = None;
 
     let mut this_frame_entity_to_light_id = EntityHashMap::<u32>::default();
-    let previous_frame_light_entities: Vec<_> = raytracing_scene_bindings
-        .previous_frame_light_entities
-        .drain(..)
-        .collect();
+    let previous_frame_light_entities: Vec<_> =
+        s.previous_frame_light_entities.drain(..).collect();
 
     if instances_query.iter().len() == 0 {
         return;
@@ -69,22 +78,31 @@ pub fn prepare_raytracing_scene_bindings(
     let mut index_buffers = CachedBindingArray::new();
     let mut textures = CachedBindingArray::new();
     let mut samplers = Vec::new();
-    let mut materials = StorageBufferList::<GpuMaterial>::default();
-    let mut tlas = render_device
-        .wgpu_device()
-        .create_tlas(&CreateTlasDescriptor {
-            label: Some("tlas"),
-            flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
-            update_mode: AccelerationStructureUpdateMode::Build,
-            max_instances: instances_query.iter().len() as u32,
-        });
-    let mut transforms = StorageBufferList::<Mat4>::default();
-    let mut previous_frame_transforms = StorageBufferList::<Mat4>::default();
-    let mut geometry_ids = StorageBufferList::<GpuInstanceGeometryIds>::default();
-    let mut material_ids = StorageBufferList::<u32>::default();
-    let mut light_sources = StorageBufferList::<GpuLightSource>::default();
-    let mut directional_lights = StorageBufferList::<GpuDirectionalLight>::default();
-    let mut previous_frame_light_id_translations = StorageBufferList::<u32>::default();
+    s.materials.get_mut().clear();
+    s.transforms.get_mut().clear();
+    s.previous_frame_transforms.get_mut().clear();
+    s.geometry_ids.get_mut().clear();
+    s.material_ids.get_mut().clear();
+    s.light_sources.get_mut().clear();
+    s.directional_lights.get_mut().clear();
+    s.previous_frame_light_id_translations.get_mut().clear();
+
+    let instance_count = instances_query.iter().len() as u32;
+    if instance_count > s.tlas_max_instances {
+        let new_max = ((instance_count as f32) * 1.5).ceil() as u32;
+        s.tlas = Some(
+            render_device
+                .wgpu_device()
+                .create_tlas(&CreateTlasDescriptor {
+                    label: Some("tlas"),
+                    flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
+                    update_mode: AccelerationStructureUpdateMode::Build,
+                    max_instances: new_max,
+                }),
+        );
+        s.tlas_max_instances = new_max;
+    }
+    let tlas = s.tlas.as_mut().unwrap();
 
     let mut material_id_map: HashMap<AssetId<StandardMaterial>, u32, FixedHasher> =
         HashMap::default();
@@ -121,7 +139,7 @@ pub fn prepare_raytracing_scene_bindings(
             continue;
         };
 
-        materials.get_mut().push(GpuMaterial {
+        s.materials.get_mut().push(GpuMaterial {
             normal_map_texture_id,
             base_color_texture_id,
             emissive_texture_id,
@@ -162,7 +180,7 @@ pub fn prepare_raytracing_scene_bindings(
         let Some(material_id) = material_id_map.get(&material.id()).copied() else {
             continue;
         };
-        let Some(material) = materials.get().get(material_id as usize) else {
+        let Some(material) = s.materials.get().get(material_id as usize) else {
             continue;
         };
 
@@ -174,8 +192,8 @@ pub fn prepare_raytracing_scene_bindings(
             0xFF,
         ));
 
-        transforms.get_mut().push(transform);
-        previous_frame_transforms.get_mut().push(
+        s.transforms.get_mut().push(transform);
+        s.previous_frame_transforms.get_mut().push(
             previous_frame_transform
                 .map(|t| Mat4::from(t.0))
                 .unwrap_or(transform),
@@ -190,7 +208,7 @@ pub fn prepare_raytracing_scene_bindings(
             index_slice.buffer.id(),
         );
 
-        geometry_ids.get_mut().push(GpuInstanceGeometryIds {
+        s.geometry_ids.get_mut().push(GpuInstanceGeometryIds {
             vertex_buffer_id,
             vertex_buffer_offset: vertex_slice.range.start,
             index_buffer_id,
@@ -198,20 +216,19 @@ pub fn prepare_raytracing_scene_bindings(
             triangle_count: (index_slice.range.len() / 3) as u32,
         });
 
-        material_ids.get_mut().push(material_id);
+        s.material_ids.get_mut().push(material_id);
 
         if material.emissive != Vec3::ZERO {
-            light_sources
+            s.light_sources
                 .get_mut()
                 .push(GpuLightSource::new_emissive_mesh_light(
                     instance_id as u32,
                     (index_slice.range.len() / 3) as u32,
                 ));
 
-            this_frame_entity_to_light_id.insert(entity, light_sources.get().len() as u32 - 1);
-            raytracing_scene_bindings
-                .previous_frame_light_entities
-                .push(entity);
+            this_frame_entity_to_light_id
+                .insert(entity, s.light_sources.get().len() as u32 - 1);
+            s.previous_frame_light_entities.push(entity);
         }
 
         instance_id += 1;
@@ -222,19 +239,18 @@ pub fn prepare_raytracing_scene_bindings(
     }
 
     for (entity, directional_light) in &directional_lights_query {
-        let directional_lights = directional_lights.get_mut();
+        let directional_lights = s.directional_lights.get_mut();
         let directional_light_id = directional_lights.len() as u32;
 
         directional_lights.push(GpuDirectionalLight::new(directional_light));
 
-        light_sources
+        s.light_sources
             .get_mut()
             .push(GpuLightSource::new_directional_light(directional_light_id));
 
-        this_frame_entity_to_light_id.insert(entity, light_sources.get().len() as u32 - 1);
-        raytracing_scene_bindings
-            .previous_frame_light_entities
-            .push(entity);
+        this_frame_entity_to_light_id
+            .insert(entity, s.light_sources.get().len() as u32 - 1);
+        s.previous_frame_light_entities.push(entity);
     }
 
     for previous_frame_light_entity in previous_frame_light_entities {
@@ -242,47 +258,56 @@ pub fn prepare_raytracing_scene_bindings(
             .get(&previous_frame_light_entity)
             .copied()
             .unwrap_or(LIGHT_NOT_PRESENT_THIS_FRAME);
-        previous_frame_light_id_translations
+        s.previous_frame_light_id_translations
             .get_mut()
             .push(current_frame_index);
     }
 
-    if light_sources.get().len() > u16::MAX as usize {
+    if s.light_sources.get().len() > u16::MAX as usize {
         panic!("Too many light sources in the scene, maximum is 65536.");
     }
 
-    materials.write_buffer(&render_device, &render_queue);
-    transforms.write_buffer(&render_device, &render_queue);
-    previous_frame_transforms.write_buffer(&render_device, &render_queue);
-    geometry_ids.write_buffer(&render_device, &render_queue);
-    material_ids.write_buffer(&render_device, &render_queue);
-    light_sources.write_buffer(&render_device, &render_queue);
-    directional_lights.write_buffer(&render_device, &render_queue);
-    previous_frame_light_id_translations.write_buffer(&render_device, &render_queue);
+    s.materials.write_buffer(&render_device, &render_queue);
+    s.transforms.write_buffer(&render_device, &render_queue);
+    s.previous_frame_transforms
+        .write_buffer(&render_device, &render_queue);
+    s.geometry_ids.write_buffer(&render_device, &render_queue);
+    s.material_ids.write_buffer(&render_device, &render_queue);
+    s.light_sources
+        .write_buffer(&render_device, &render_queue);
+    s.directional_lights
+        .write_buffer(&render_device, &render_queue);
+    s.previous_frame_light_id_translations
+        .write_buffer(&render_device, &render_queue);
+
+    // Clear unused TLAS slots beyond the current instance count
+    for i in instance_id..s.tlas_max_instances as usize {
+        *tlas.get_mut_single(i).unwrap() = None;
+    }
 
     let mut command_encoder = render_device.create_command_encoder(&CommandEncoderDescriptor {
         label: Some("build_tlas_command_encoder"),
     });
-    command_encoder.build_acceleration_structures(&[], [&tlas]);
+    command_encoder.build_acceleration_structures(&[], [&*tlas]);
     render_queue.submit([command_encoder.finish()]);
 
-    raytracing_scene_bindings.bind_group = Some(render_device.create_bind_group(
+    s.bind_group = Some(render_device.create_bind_group(
         "raytracing_scene_bind_group",
-        &pipeline_cache.get_bind_group_layout(&raytracing_scene_bindings.bind_group_layout),
+        &pipeline_cache.get_bind_group_layout(&s.bind_group_layout),
         &BindGroupEntries::sequential((
             vertex_buffers.as_slice(),
             index_buffers.as_slice(),
             textures.as_slice(),
             samplers.as_slice(),
-            materials.binding().unwrap(),
+            s.materials.binding().unwrap(),
             tlas.as_binding(),
-            transforms.binding().unwrap(),
-            previous_frame_transforms.binding().unwrap(),
-            geometry_ids.binding().unwrap(),
-            material_ids.binding().unwrap(),
-            light_sources.binding().unwrap(),
-            directional_lights.binding().unwrap(),
-            previous_frame_light_id_translations.binding().unwrap(),
+            s.transforms.binding().unwrap(),
+            s.previous_frame_transforms.binding().unwrap(),
+            s.geometry_ids.binding().unwrap(),
+            s.material_ids.binding().unwrap(),
+            s.light_sources.binding().unwrap(),
+            s.directional_lights.binding().unwrap(),
+            s.previous_frame_light_id_translations.binding().unwrap(),
         )),
     ));
 }
@@ -314,6 +339,16 @@ impl RaytracingSceneBindings {
                 ),
             ),
             previous_frame_light_entities: Vec::new(),
+            materials: Default::default(),
+            transforms: Default::default(),
+            previous_frame_transforms: Default::default(),
+            geometry_ids: Default::default(),
+            material_ids: Default::default(),
+            light_sources: Default::default(),
+            directional_lights: Default::default(),
+            previous_frame_light_id_translations: Default::default(),
+            tlas: None,
+            tlas_max_instances: 0,
         }
     }
 }
