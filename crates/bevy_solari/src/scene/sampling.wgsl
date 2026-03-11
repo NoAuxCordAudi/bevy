@@ -3,9 +3,10 @@ enable wgpu_ray_query;
 #define_import_path bevy_solari::sampling
 
 #import bevy_pbr::lighting::D_GGX
-#import bevy_pbr::utils::{rand_f, rand_vec2f, rand_u, rand_range_u}
-#import bevy_render::maths::{PI_2, orthonormalize}
-#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_pbr::pbr_functions::calculate_tbn_mikktspace
+#import bevy_pbr::utils::{rand_f, rand_vec2f, rand_u, rand_range_u, sample_cosine_hemisphere}
+#import bevy_render::maths::{PI, PI_2, orthonormalize}
+#import bevy_solari::scene_bindings::{trace_ray, RAY_T_MIN, RAY_T_MAX, light_sources, directional_lights, LightSource, LIGHT_SOURCE_KIND_DIRECTIONAL, LIGHT_SOURCE_KIND_EMISSIVE_MESH, resolve_triangle_data_full, ResolvedRayHitFull, MIRROR_ROUGHNESS_THRESHOLD}
 
 fn power_heuristic(f: f32, g: f32) -> f32 {
     return balance_heuristic(f * f, g * g);
@@ -231,4 +232,142 @@ fn triangle_barycentrics(seed: u32) -> vec3<f32> {
     var barycentrics = rand_vec2f(&rng);
     if barycentrics.x + barycentrics.y > 1.0 { barycentrics = 1.0 - barycentrics; }
     return vec3(1.0 - barycentrics.x - barycentrics.y, barycentrics);
+}
+
+// ---------------------------------------------------------------------------
+// Reverse PDF infrastructure (Phase 6.3)
+// ---------------------------------------------------------------------------
+
+/// Computes the reverse PDF p(wi | wo) under the mixed diffuse/specular
+/// sampling strategy, i.e., the probability that the BRDF importance sampler
+/// would have generated `wi` if `wo` were treated as the outgoing direction.
+///
+/// This is needed for VCM MIS weight computation on bidirectional paths.
+/// The function mirrors `brdf_pdf()` in pathtracer.wgsl but swaps the roles
+/// of wi and wo when evaluating the GGX VNDF component.
+fn brdf_pdf_reverse(wo: vec3<f32>, wi: vec3<f32>, ray_hit: ResolvedRayHitFull) -> f32 {
+    if ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD {
+        return 0.0;
+    }
+
+    let diffuse_weight = mix(mix(0.4, 0.9, ray_hit.material.perceptual_roughness), 0.0, ray_hit.material.metallic);
+    let specular_weight = 1.0 - diffuse_weight;
+
+    let TBN = calculate_tbn_mikktspace(ray_hit.world_normal, ray_hit.world_tangent);
+    let T = TBN[0];
+    let B = TBN[1];
+    let N = TBN[2];
+
+    let wo_tangent = vec3(dot(wo, T), dot(wo, B), dot(wo, N));
+    let wi_tangent = vec3(dot(wi, T), dot(wi, B), dot(wi, N));
+
+    // Reverse: treat wi as the "viewing" direction, wo as the "sampled" direction
+    // Diffuse PDF only depends on the sampled direction's cosine with N
+    let diffuse_pdf = max(0.0, wo_tangent.z) / PI;
+    // Specular VNDF PDF with wi as the incident (viewing) direction
+    let specular_pdf = ggx_vndf_pdf(wi_tangent, wo_tangent, ray_hit.material.roughness);
+    return diffuse_weight * diffuse_pdf + specular_weight * specular_pdf;
+}
+
+// ---------------------------------------------------------------------------
+// Light emission PDF and sampling (Phase 6.4)
+// ---------------------------------------------------------------------------
+
+/// Result of sampling emission from a light source: a position on the light,
+/// an outgoing emission direction, and the associated PDFs.
+struct LightEmissionSample {
+    /// World-space position on the light surface (area lights) or
+    /// a sentinel value for directional lights.
+    position: vec3<f32>,
+    /// World-space normal at the emission point.
+    normal: vec3<f32>,
+    /// Outgoing emission direction (away from the light surface).
+    direction: vec3<f32>,
+    /// Emitted radiance along `direction`.
+    radiance: vec3<f32>,
+    /// PDF of choosing this position on this light source (w.r.t. area).
+    /// For directional lights this is set to 1.0 (delta in direction).
+    pdf_position: f32,
+    /// PDF of the emission direction given the position (w.r.t. solid angle).
+    /// For area lights this is cos(theta) / PI (cosine-weighted hemisphere).
+    /// For directional lights this is 1.0 (delta distribution).
+    pdf_direction: f32,
+    /// Probability of picking this light among all light sources.
+    pdf_light_pick: f32,
+    /// True when the light source is a directional (infinite) light.
+    is_directional: bool,
+}
+
+/// Computes the directional PDF of emission from an area light surface.
+/// Given a surface normal and an outgoing direction, returns the
+/// cosine-weighted hemisphere PDF: cos(theta) / PI. Returns 0 if the
+/// direction points below the surface.
+fn light_emission_direction_pdf(normal: vec3<f32>, direction: vec3<f32>) -> f32 {
+    return max(0.0, dot(normal, direction)) / PI;
+}
+
+/// Computes the positional PDF of a point on an area light.
+/// For uniform sampling over a triangle mesh with `triangle_count`
+/// triangles each of area `triangle_area`, the PDF w.r.t. area is:
+///   1.0 / (triangle_count * triangle_area)
+fn light_emission_position_pdf(triangle_count: u32, triangle_area: f32) -> f32 {
+    return 1.0 / (f32(triangle_count) * triangle_area);
+}
+
+/// Samples a light source and an emission point + direction from it.
+/// This is used to start light subpaths in bidirectional methods.
+///
+/// For area lights (emissive meshes):
+///   - Position: uniform random point on a random triangle
+///   - Direction: cosine-weighted hemisphere above the surface normal
+///
+/// For directional lights:
+///   - Position: not physically meaningful (set to vec3(0))
+///   - Direction: the light direction (possibly jittered for soft shadows)
+fn sample_light_emission(rng: ptr<function, u32>) -> LightEmissionSample {
+    var result: LightEmissionSample;
+
+    let light_count = arrayLength(&light_sources);
+    let light_id = rand_range_u(light_count, rng);
+    let light_source = light_sources[light_id];
+
+    result.pdf_light_pick = 1.0 / f32(light_count);
+
+    if light_source.kind == LIGHT_SOURCE_KIND_DIRECTIONAL {
+        let dir_light = directional_lights[light_source.id];
+
+        result.position = vec3(0.0);
+        result.normal = -dir_light.direction_to_light;
+        result.direction = -dir_light.direction_to_light;
+        result.radiance = dir_light.luminance;
+        result.pdf_position = 1.0;
+        result.pdf_direction = 1.0;
+        result.is_directional = true;
+    } else {
+        // Emissive mesh: pick a random triangle, then a random point on it
+        let triangle_count = light_source.kind >> 1u;
+        let triangle_id = rand_range_u(triangle_count, rng);
+
+        let seed = rand_u(rng);
+        let barycentrics = triangle_barycentrics(seed);
+        let triangle_data = resolve_triangle_data_full(light_source.id, triangle_id, barycentrics);
+
+        result.position = triangle_data.world_position;
+        result.normal = triangle_data.world_normal;
+        result.radiance = triangle_data.material.emissive;
+
+        // Positional PDF: 1 / (total surface area visible to this sampling strategy)
+        result.pdf_position = 1.0 / (f32(triangle_count) * triangle_data.triangle_area);
+
+        // Sample cosine-weighted hemisphere direction for emission
+        result.direction = sample_cosine_hemisphere(triangle_data.world_normal, rng);
+
+        // Directional PDF: cos(theta) / PI for cosine-weighted hemisphere
+        let cos_theta = max(0.0, dot(result.direction, triangle_data.world_normal));
+        result.pdf_direction = cos_theta / PI;
+
+        result.is_directional = false;
+    }
+
+    return result;
 }

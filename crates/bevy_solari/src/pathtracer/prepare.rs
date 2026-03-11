@@ -94,6 +94,8 @@ pub fn prepare_pathtracer_settings_buffer(
             min_samples: pathtracer.min_samples,
             max_samples: pathtracer.max_samples,
             convergence_threshold: pathtracer.convergence_threshold,
+            aperture_radius: pathtracer.aperture_radius,
+            focal_distance: pathtracer.focal_distance,
         });
         buffer.write_buffer(&render_device, &render_queue);
         commands

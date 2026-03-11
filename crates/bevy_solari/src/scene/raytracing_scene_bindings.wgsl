@@ -51,7 +51,11 @@ struct Material {
     emissive: vec3<f32>,
     metallic: f32,
     reflectance: vec3<f32>,
-    _padding: f32,
+    specular_transmission: f32,
+    ior: f32,
+    _padding_a: f32,
+    _padding_b: f32,
+    _padding_c: f32,
 }
 
 const TEXTURE_MAP_NONE = 0xFFFFFFFFu;
@@ -113,6 +117,8 @@ struct ResolvedMaterial {
     perceptual_roughness: f32,
     roughness: f32,
     metallic: f32,
+    specular_transmission: f32,
+    ior: f32,
 }
 
 struct ResolvedRayHitFull {
@@ -151,6 +157,9 @@ fn resolve_material(material: Material, uv: vec2<f32>) -> ResolvedMaterial {
     }
 
     m.roughness = perceptualRoughnessToRoughness(m.perceptual_roughness);
+
+    m.specular_transmission = material.specular_transmission;
+    m.ior = material.ior;
 
     return m;
 }

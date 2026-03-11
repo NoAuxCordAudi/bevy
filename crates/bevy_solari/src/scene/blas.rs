@@ -1,5 +1,5 @@
-use alloc::collections::VecDeque;
 use bevy_asset::AssetId;
+use tracing::warn;
 use bevy_ecs::{
     resource::Resource,
     system::{Res, ResMut},
@@ -16,14 +16,9 @@ use bevy_render::{
     renderer::{RenderDevice, RenderQueue},
 };
 
-/// After compacting this many vertices worth of meshes per frame, no further BLAS will be compacted.
-/// Lower this number to distribute the work across more frames.
-const MAX_COMPACTION_VERTICES_PER_FRAME: u32 = 400_000;
-
 #[derive(Resource, Default)]
 pub struct BlasManager {
     blas: HashMap<AssetId<Mesh>, Blas>,
-    compaction_queue: VecDeque<(AssetId<Mesh>, u32, bool)>,
 }
 
 impl BlasManager {
@@ -34,7 +29,7 @@ impl BlasManager {
 
 pub fn prepare_raytracing_blas(
     mut blas_manager: ResMut<BlasManager>,
-    extracted_meshes: Res<ExtractedAssets<RenderMesh>>,
+    mut extracted_meshes: ResMut<ExtractedAssets<RenderMesh>>,
     mesh_allocator: Res<MeshAllocator>,
     render_device: Res<RenderDevice>,
     render_queue: Res<RenderQueue>,
@@ -52,6 +47,26 @@ pub fn prepare_raytracing_blas(
         return;
     }
 
+    // Auto-generate tangents for raytracing meshes that are missing them
+    for (_, mesh) in extracted_meshes.extracted.iter_mut() {
+        if mesh.enable_raytracing
+            && mesh.contains_attribute(Mesh::ATTRIBUTE_POSITION)
+            && mesh.contains_attribute(Mesh::ATTRIBUTE_NORMAL)
+            && mesh.contains_attribute(Mesh::ATTRIBUTE_UV_0)
+            && !mesh.contains_attribute(Mesh::ATTRIBUTE_TANGENT)
+        {
+            tracing::debug!(
+                "Auto-generating tangents for raytracing mesh missing Vertex_Tangent attribute"
+            );
+            if let Err(err) = mesh.generate_tangents() {
+                warn!(
+                    "Failed to auto-generate tangents for raytracing: {}. Mesh will be skipped.",
+                    err
+                );
+            }
+        }
+    }
+
     // Create new BLAS for added or changed meshes
     let blas_resources = extracted_meshes
         .extracted
@@ -65,9 +80,6 @@ pub fn prepare_raytracing_blas(
                 allocate_blas(&vertex_slice, &index_slice, asset_id, &render_device);
 
             blas_manager.blas.insert(*asset_id, blas);
-            blas_manager
-                .compaction_queue
-                .push_back((*asset_id, blas_size.vertex_count, false));
 
             (*asset_id, vertex_slice, index_slice, blas_size)
         })
@@ -101,46 +113,6 @@ pub fn prepare_raytracing_blas(
     render_queue.submit([command_encoder.finish()]);
 }
 
-pub fn compact_raytracing_blas(
-    mut blas_manager: ResMut<BlasManager>,
-    render_queue: Res<RenderQueue>,
-) {
-    let queue_size = blas_manager.compaction_queue.len();
-    let mut meshes_processed = 0;
-    let mut vertices_compacted = 0;
-
-    while !blas_manager.compaction_queue.is_empty()
-        && vertices_compacted < MAX_COMPACTION_VERTICES_PER_FRAME
-        && meshes_processed < queue_size
-    {
-        meshes_processed += 1;
-
-        let (mesh, vertex_count, compaction_started) =
-            blas_manager.compaction_queue.pop_front().unwrap();
-
-        let Some(blas) = blas_manager.get(&mesh) else {
-            continue;
-        };
-
-        if !compaction_started {
-            blas.prepare_compaction_async(|_| {});
-        }
-
-        if blas.ready_for_compaction() {
-            let compacted_blas = render_queue.compact_blas(blas);
-            blas_manager.blas.insert(mesh, compacted_blas);
-
-            vertices_compacted += vertex_count;
-            continue;
-        }
-
-        // BLAS not ready for compaction, put back in queue
-        blas_manager
-            .compaction_queue
-            .push_back((mesh, vertex_count, true));
-    }
-}
-
 fn allocate_blas(
     vertex_slice: &MeshBufferSlice,
     index_slice: &MeshBufferSlice,
@@ -158,8 +130,7 @@ fn allocate_blas(
     let blas = render_device.wgpu_device().create_blas(
         &CreateBlasDescriptor {
             label: Some(&asset_id.to_string()),
-            flags: AccelerationStructureFlags::PREFER_FAST_TRACE
-                | AccelerationStructureFlags::ALLOW_COMPACTION,
+            flags: AccelerationStructureFlags::PREFER_FAST_TRACE,
             update_mode: AccelerationStructureUpdateMode::Build,
         },
         BlasGeometrySizeDescriptors::Triangles {
@@ -172,12 +143,34 @@ fn allocate_blas(
 
 fn is_mesh_raytracing_compatible(mesh: &Mesh) -> bool {
     let triangle_list = mesh.primitive_topology() == PrimitiveTopology::TriangleList;
-    let vertex_attributes = mesh.attributes().map(|(attribute, _)| attribute.id).eq([
+    let expected_attrs = [
         Mesh::ATTRIBUTE_POSITION.id,
         Mesh::ATTRIBUTE_NORMAL.id,
         Mesh::ATTRIBUTE_UV_0.id,
         Mesh::ATTRIBUTE_TANGENT.id,
-    ]);
+    ];
+    let vertex_attributes = mesh.attributes().map(|(attribute, _)| attribute.id).eq(expected_attrs);
     let indexed_32 = matches!(mesh.indices(), Some(Indices::U32(..)));
+
+    if mesh.enable_raytracing && triangle_list && !vertex_attributes && indexed_32 {
+        let has_required = expected_attrs.iter().all(|req| {
+            mesh.attributes().any(|(attr, _)| attr.id == *req)
+        });
+        let actual: Vec<_> = mesh.attributes().map(|(attr, _)| attr.name).collect();
+        if has_required {
+            warn!(
+                "Mesh has required raytracing attributes but also has extras {:?}. \
+                 Strip extra attributes for Solari compatibility.",
+                actual
+            );
+        } else {
+            warn!(
+                "Mesh is missing required raytracing attributes. Has: {:?}, needs: \
+                 [Position, Normal, UV_0, Tangent].",
+                actual
+            );
+        }
+    }
+
     mesh.enable_raytracing && triangle_list && vertex_attributes && indexed_32
 }

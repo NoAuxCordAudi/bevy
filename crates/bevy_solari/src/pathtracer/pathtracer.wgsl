@@ -2,10 +2,10 @@ enable wgpu_ray_query;
 
 #import bevy_core_pipeline::tonemapping::tonemapping_luminance as luminance
 #import bevy_pbr::pbr_functions::calculate_tbn_mikktspace
-#import bevy_pbr::utils::{rand_f, rand_vec2f, sample_cosine_hemisphere, halton_2d}
+#import bevy_pbr::utils::{rand_f, rand_vec2f, sample_cosine_hemisphere, halton_2d, sample_disk}
 #import bevy_render::maths::PI
 #import bevy_render::view::View
-#import bevy_solari::brdf::evaluate_brdf
+#import bevy_solari::brdf::{evaluate_brdf, fresnel_dielectric, refract_ray, is_total_internal_reflection}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, sample_ggx_vndf, ggx_vndf_pdf, power_heuristic}
 #import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, ResolvedRayHitFull, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
 
@@ -22,6 +22,8 @@ struct PathtracerSettings {
     min_samples: u32,
     max_samples: u32,
     convergence_threshold: f32,
+    aperture_radius: f32,
+    focal_distance: f32,
 }
 
 @group(1) @binding(0) var accumulation_texture: texture_storage_2d<rgba32float, read_write>;
@@ -78,6 +80,17 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let primary_ray_target = view.world_from_clip * vec4(pixel_ndc.x, -pixel_ndc.y, 1.0, 1.0);
     var ray_origin = view.world_position;
     var ray_direction = normalize((primary_ray_target.xyz / primary_ray_target.w) - ray_origin);
+
+    // Depth of field: thin lens approximation
+    if settings.aperture_radius > 0.0 {
+        let focal_point = ray_origin + settings.focal_distance * ray_direction;
+        let camera_right = view.world_from_view[0].xyz;
+        let camera_up = view.world_from_view[1].xyz;
+        let disk_offset = sample_disk(settings.aperture_radius, &rng);
+        ray_origin = ray_origin + disk_offset.x * camera_right + disk_offset.y * camera_up;
+        ray_direction = normalize(focal_point - ray_origin);
+    }
+
     var ray_t_min = 0.0;
 
     // Path trace
@@ -101,8 +114,9 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             }
             radiance += mis_weight * throughput * ray_hit.material.emissive;
 
-            // Sample direct lighting, but only if the surface is not mirror-like
-            let is_perfectly_specular = ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
+            // Sample direct lighting, but only if the surface is not mirror-like or dielectric
+            let is_dielectric = ray_hit.material.specular_transmission > 0.5;
+            let is_perfectly_specular = (ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999) || is_dielectric;
             if !is_perfectly_specular {
                 let direct_lighting = sample_random_light(ray_hit.world_position, ray_hit.world_normal, &rng);
 
@@ -119,14 +133,22 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             // Sample new ray direction from the material BRDF for next bounce
             let next_bounce = importance_sample_next_bounce(wo, ray_hit, &rng);
             ray_direction = next_bounce.wi;
-            ray_origin = ray_hit.world_position;
-            ray_t_min = RAY_T_MIN;
             p_bounce = next_bounce.pdf;
             bounce_was_perfect_reflection = next_bounce.perfectly_specular_bounce;
 
-            // Update throughput for next bounce
-            let brdf = evaluate_brdf(ray_hit.world_normal, wo, next_bounce.wi, ray_hit.material);
-            throughput *= brdf / next_bounce.pdf;
+            if next_bounce.is_dielectric {
+                // Dielectric: offset origin to correct side of surface and tint by base color
+                let normal_sign = sign(dot(next_bounce.wi, ray_hit.geometric_world_normal));
+                ray_origin = ray_hit.world_position + normal_sign * ray_hit.geometric_world_normal * RAY_T_MIN * 2.0;
+                ray_t_min = RAY_T_MIN;
+                throughput *= ray_hit.material.base_color;
+            } else {
+                // Standard BRDF bounce
+                ray_origin = ray_hit.world_position;
+                ray_t_min = RAY_T_MIN;
+                let brdf = evaluate_brdf(ray_hit.world_normal, wo, next_bounce.wi, ray_hit.material);
+                throughput *= brdf / next_bounce.pdf;
+            }
             if !is_valid(throughput) { break; }
 
             // Russian roulette for early termination
@@ -179,12 +201,14 @@ struct NextBounce {
     /// The sampled outgoing light direction (toward the next bounce).
     wi: vec3<f32>,
     /// Probability density of having sampled `wi` under the mixed
-    /// diffuse/specular sampling strategy. Set to 1.0 for perfect mirrors.
+    /// diffuse/specular sampling strategy. Set to 1.0 for perfect mirrors
+    /// and dielectrics.
     pdf: f32,
-    /// `true` when the surface is a perfect mirror (roughness ≤ threshold
-    /// and fully metallic), meaning no direct-lighting MIS is needed for
-    /// emissive hits on the next bounce.
+    /// `true` when the surface is a perfect mirror or dielectric, meaning
+    /// no direct-lighting MIS is needed for emissive hits on the next bounce.
     perfectly_specular_bounce: bool,
+    /// `true` when the bounce is through a dielectric (glass) surface.
+    is_dielectric: bool,
 }
 
 /// Importance-samples a new bounce direction from the material BRDF at the
@@ -203,9 +227,29 @@ struct NextBounce {
 /// The combined PDF is the weighted sum of both strategies so it can be used
 /// for MIS with direct-light sampling.
 fn importance_sample_next_bounce(wo: vec3<f32>, ray_hit: ResolvedRayHitFull, rng: ptr<function, u32>) -> NextBounce {
+    // Dielectric (glass) materials: refract or reflect based on Fresnel
+    let is_dielectric = ray_hit.material.specular_transmission > 0.5;
+    if is_dielectric {
+        let front_face = dot(wo, ray_hit.geometric_world_normal) > 0.0;
+        let eta = select(ray_hit.material.ior, 1.0 / ray_hit.material.ior, front_face);
+        let n = select(-ray_hit.geometric_world_normal, ray_hit.geometric_world_normal, front_face);
+
+        let cos_theta_i = min(dot(wo, n), 1.0);
+        let total_internal_reflection = is_total_internal_reflection(cos_theta_i, eta);
+        let fresnel = fresnel_dielectric(cos_theta_i, eta);
+
+        var wi: vec3<f32>;
+        if total_internal_reflection || rand_f(rng) < fresnel {
+            wi = reflect(-wo, n);
+        } else {
+            wi = refract_ray(-wo, n, eta);
+        }
+        return NextBounce(wi, 1.0, true, true);
+    }
+
     let is_perfectly_specular = ray_hit.material.roughness <= MIRROR_ROUGHNESS_THRESHOLD && ray_hit.material.metallic > 0.9999;
     if is_perfectly_specular {
-        return NextBounce(reflect(-wo, ray_hit.world_normal), 1.0, true);
+        return NextBounce(reflect(-wo, ray_hit.world_normal), 1.0, true, false);
     }
     let diffuse_weight = mix(mix(0.4, 0.9, ray_hit.material.perceptual_roughness), 0.0, ray_hit.material.metallic);
     let specular_weight = 1.0 - diffuse_weight;
@@ -232,7 +276,7 @@ fn importance_sample_next_bounce(wo: vec3<f32>, ray_hit: ResolvedRayHitFull, rng
     let specular_pdf = ggx_vndf_pdf(wo_tangent, wi_tangent, ray_hit.material.roughness);
     let pdf = (diffuse_weight * diffuse_pdf) + (specular_weight * specular_pdf);
 
-    return NextBounce(wi, pdf, false);
+    return NextBounce(wi, pdf, false, false);
 }
 
 /// Evaluates the probability density of sampling direction `wi` given
@@ -245,6 +289,9 @@ fn importance_sample_next_bounce(wo: vec3<f32>, ray_hit: ResolvedRayHitFull, rng
 /// PDF the BRDF sampling strategy would have assigned to that same direction
 /// in order to compute the MIS weight via the power heuristic.
 fn brdf_pdf(wo: vec3<f32>, wi: vec3<f32>, ray_hit: ResolvedRayHitFull) -> f32 {
+    if ray_hit.material.specular_transmission > 0.5 {
+        return 0.0;
+    }
     let diffuse_weight = mix(mix(0.4, 0.9, ray_hit.material.perceptual_roughness), 0.0, ray_hit.material.metallic);
     let specular_weight = 1.0 - diffuse_weight;
 

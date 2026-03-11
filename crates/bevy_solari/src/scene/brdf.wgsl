@@ -5,6 +5,37 @@
 #import bevy_render::maths::PI
 #import bevy_solari::scene_bindings::{ResolvedMaterial, MIRROR_ROUGHNESS_THRESHOLD}
 
+/// Returns true when the incident angle exceeds the critical angle for
+/// total internal reflection (sin²θt > 1).
+fn is_total_internal_reflection(cos_i: f32, eta: f32) -> bool {
+    let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
+    return sin2_t > 1.0;
+}
+
+/// Schlick approximation for dielectric Fresnel reflectance.
+/// `cos_theta` is the cosine of the incident angle, `eta` is the ratio
+/// of refractive indices (n_incident / n_transmitted).
+fn fresnel_dielectric(cos_theta: f32, eta: f32) -> f32 {
+    var r0 = (1.0 - eta) / (1.0 + eta);
+    r0 = r0 * r0;
+    let x = 1.0 - cos_theta;
+    return r0 + (1.0 - r0) * x * x * x * x * x;
+}
+
+/// Computes the refraction direction using Snell's law.
+/// `incident` points toward the surface, `normal` points away from the
+/// surface on the side the incident ray is coming from, `eta` is the ratio
+/// of refractive indices. Returns vec3(0) on total internal reflection.
+fn refract_ray(incident: vec3<f32>, normal: vec3<f32>, eta: f32) -> vec3<f32> {
+    let cos_i = dot(-incident, normal);
+    let sin2_t = eta * eta * (1.0 - cos_i * cos_i);
+    if sin2_t > 1.0 {
+        return vec3(0.0);
+    }
+    let cos_t = sqrt(1.0 - sin2_t);
+    return eta * incident + (eta * cos_i - cos_t) * normal;
+}
+
 fn evaluate_brdf(
     world_normal: vec3<f32>,
     wo: vec3<f32>,

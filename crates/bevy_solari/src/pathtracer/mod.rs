@@ -98,6 +98,13 @@ pub struct Pathtracer {
     /// is considered converged when `sqrt(variance / n) / mean < threshold`.
     /// Set to `0.0` to disable convergence (all pixels run to `max_samples`).
     pub convergence_threshold: f32,
+    /// Radius of the thin-lens aperture for depth of field, in world units.
+    /// `0.0` (the default) disables DOF and uses a pinhole camera.
+    /// Automatically computed from [`DepthOfField`] if that component is present.
+    pub aperture_radius: f32,
+    /// Distance from the camera to the focal plane, in world units.
+    /// Objects at this distance will be perfectly sharp when DOF is enabled.
+    pub focal_distance: f32,
 }
 
 impl Default for Pathtracer {
@@ -107,6 +114,8 @@ impl Default for Pathtracer {
             min_samples: 64,
             max_samples: 4096,
             convergence_threshold: 0.01,
+            aperture_radius: 0.0,
+            focal_distance: 10.0,
         }
     }
 }
@@ -117,4 +126,6 @@ pub(crate) struct PathtracerSettingsUniform {
     pub min_samples: u32,
     pub max_samples: u32,
     pub convergence_threshold: f32,
+    pub aperture_radius: f32,
+    pub focal_distance: f32,
 }
