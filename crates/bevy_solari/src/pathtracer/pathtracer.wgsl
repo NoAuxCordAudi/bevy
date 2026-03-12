@@ -7,7 +7,8 @@ enable wgpu_ray_query;
 #import bevy_render::view::View
 #import bevy_solari::brdf::{evaluate_brdf, fresnel_dielectric, refract_ray, is_total_internal_reflection}
 #import bevy_solari::sampling::{sample_random_light, random_emissive_light_pdf, sample_ggx_vndf, ggx_vndf_pdf, power_heuristic}
-#import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, ResolvedRayHitFull, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD}
+#import bevy_solari::scene_bindings::{trace_ray, resolve_ray_hit_full, ResolvedRayHitFull, RAY_T_MIN, RAY_T_MAX, MIRROR_ROUGHNESS_THRESHOLD, directional_lights, light_sources}
+#import bevy_solari::sky::{evaluate_sky_ambient, evaluate_sun_disk}
 
 /// Checks whether a vec3 contains only finite, non-NaN values within a
 /// reasonable magnitude. Used as a safety check to discard degenerate
@@ -155,7 +156,24 @@ fn pathtrace(@builtin(global_invocation_id) global_id: vec3<u32>) {
             let p = min(1.0, luminance(throughput));
             if rand_f(&rng) > p { break; }
             throughput /= p;
-        } else { break; }
+        } else {
+            // Sky environment contribution for escaped rays
+            radiance += throughput * evaluate_sky_ambient(ray_direction);
+
+            // Sun disk with MIS weighting against direct light sampling
+            let sun_radiance = evaluate_sun_disk(ray_direction);
+            if any(sun_radiance > vec3(0.0)) {
+                var mis_weight = 1.0;
+                if !bounce_was_perfect_reflection {
+                    let total_light_count = arrayLength(&light_sources);
+                    let sun = directional_lights[0];
+                    let p_light = 1.0 / (sun.inverse_pdf * f32(total_light_count));
+                    mis_weight = power_heuristic(p_bounce, p_light);
+                }
+                radiance += throughput * mis_weight * sun_radiance;
+            }
+            break;
+        }
     }
 
     if !is_valid(radiance) { radiance = vec3(0.0); }

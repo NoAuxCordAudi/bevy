@@ -22,7 +22,7 @@ use bevy_render::{
     ExtractSchedule, Render, RenderApp, RenderSystems,
 };
 use binder::prepare_raytracing_scene_bindings;
-use blas::{prepare_raytracing_blas, BlasManager};
+use blas::{generate_raytracing_tangents, prepare_raytracing_blas, BlasManager};
 use extract::{extract_raytracing_scene, StandardMaterialAssets};
 use tracing::warn;
 
@@ -66,6 +66,9 @@ impl Plugin for RaytracingScenePlugin {
             .add_systems(
                 Render,
                 (
+                    generate_raytracing_tangents
+                        .in_set(RenderSystems::PrepareAssets)
+                        .before(allocate_and_free_meshes),
                     prepare_raytracing_blas
                         .in_set(RenderSystems::PrepareAssets)
                         .before(prepare_assets::<RenderMesh>)

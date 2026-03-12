@@ -27,26 +27,9 @@ impl BlasManager {
     }
 }
 
-pub fn prepare_raytracing_blas(
-    mut blas_manager: ResMut<BlasManager>,
+pub fn generate_raytracing_tangents(
     mut extracted_meshes: ResMut<ExtractedAssets<RenderMesh>>,
-    mesh_allocator: Res<MeshAllocator>,
-    render_device: Res<RenderDevice>,
-    render_queue: Res<RenderQueue>,
 ) {
-    // Delete BLAS for deleted or modified meshes
-    for asset_id in extracted_meshes
-        .removed
-        .iter()
-        .chain(extracted_meshes.modified.iter())
-    {
-        blas_manager.blas.remove(asset_id);
-    }
-
-    if extracted_meshes.extracted.is_empty() {
-        return;
-    }
-
     // Auto-generate tangents for raytracing meshes that are missing them
     for (_, mesh) in extracted_meshes.extracted.iter_mut() {
         if mesh.enable_raytracing
@@ -65,6 +48,27 @@ pub fn prepare_raytracing_blas(
                 );
             }
         }
+    }
+}
+
+pub fn prepare_raytracing_blas(
+    mut blas_manager: ResMut<BlasManager>,
+    extracted_meshes: ResMut<ExtractedAssets<RenderMesh>>,
+    mesh_allocator: Res<MeshAllocator>,
+    render_device: Res<RenderDevice>,
+    render_queue: Res<RenderQueue>,
+) {
+    // Delete BLAS for deleted or modified meshes
+    for asset_id in extracted_meshes
+        .removed
+        .iter()
+        .chain(extracted_meshes.modified.iter())
+    {
+        blas_manager.blas.remove(asset_id);
+    }
+
+    if extracted_meshes.extracted.is_empty() {
+        return;
     }
 
     // Create new BLAS for added or changed meshes
